@@ -1,0 +1,396 @@
+<!DOCTYPE html>
+<html lang="en">
+
+<head>
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0">
+    <title>City Traffic Alerts Dashboard</title>
+
+    <!-- Google Fonts -->
+    <link href="https://fonts.googleapis.com/css2?family=Inter:wght@300;400;500;600;700&display=swap" rel="stylesheet">
+
+    <!-- Leaflet Map CSS -->
+    <link rel="stylesheet" href="https://unpkg.com/leaflet@1.9.4/dist/leaflet.css" />
+
+    <!-- Custom Styles -->
+    <link rel="stylesheet" href="/static/style.css">
+
+    <!-- Socket.IO -->
+    <script src="https://cdn.socket.io/4.7.2/socket.io.min.js"></script>
+
+    <!-- Leaflet JS -->
+    <script src="https://unpkg.com/leaflet@1.9.4/dist/leaflet.js"></script>
+</head>
+
+<body>
+
+    <div class="app-container">
+        <!-- Sidebar: Live Alerts Feed -->
+        <aside class="alerts-sidebar">
+            <header class="sidebar-header">
+                <h2>Live Traffic Feed</h2>
+                <div class="status-indicator">
+                    <span class="pulse-dot"></span> System Active
+                </div>
+
+                <!-- TTS Control -->
+                <div class="tts-control">
+                    <label class="switch">
+                        <input type="checkbox" id="tts-toggle">
+                        <span class="slider round"></span>
+                    </label>
+                    <span class="tts-label">Enable Voice Alerts</span>
+                </div>
+            </header>
+
+            <div class="alerts-list" id="alerts-list">
+                <!-- Initial Alerts will be rendered here via JS -->
+            </div>
+        </aside>
+
+        <!-- Main Content -->
+        <main class="main-content">
+            <!-- Map Section -->
+            <section class="map-section">
+                <div id="map"></div>
+
+                <!-- Camera Image Feed Overlay -->
+                <div id="camera-feed" class="camera-feed hidden">
+                    <div class="feed-header">
+                        <h3 id="feed-title">Camera Feed</h3>
+                        <button id="close-feed" class="close-btn">&times;</button>
+                    </div>
+                    <img id="feed-image" src="" alt="Live Camera Feed" />
+                </div>
+
+                <div class="map-overlay">
+                    <div class="stat-card">
+                        <h3 id="stat-cameras">0</h3>
+                        <p>Active Cameras</p>
+                    </div>
+                    <div class="stat-card">
+                        <h3 id="stat-vehicles">0</h3>
+                        <p>Vehicles Monitored</p>
+                    </div>
+                    <div class="stat-card warning">
+                        <h3 id="stat-incidents">0</h3>
+                        <p>Incidents</p>
+                    </div>
+                </div>
+            </section>
+        </main>
+    </div>
+
+    <!-- Pass initial data from server to JS -->
+    <script>
+        const INITIAL_ALERTS = {{ initial_alerts | tojson | safe }};
+    </script>
+
+    <!-- App Logic -->
+    <script>
+        // Global State
+        const state = {
+            alerts: {}, //camera_id -> alert data
+            markers: {}, //camera_id -> leaflet marker
+            totalVehicles: 0,
+            incidents: 0,
+            ttsEnabled: false
+        };
+
+        //Map Initialization
+        //Center on Singapore
+        const map = L.map('map').setView([1.3521, 103.8198], 11);
+
+        //Dark theme map tiles
+        L.tileLayer('https://{s}.basemaps.cartocdn.com/dark_all/{z}/{x}/{y}{r}.png', {
+            attribution: '&copy; <a href="https://www.openstreetmap.org/copyright">OpenStreetMap</a> contributors &copy; <a href="https://carto.com/attributions">CARTO</a>',
+            subdomains: 'abcd',
+            maxZoom: 20
+        }).addTo(map);
+
+        //TTS Engine (Server-Side via Microsoft Neural Voices)
+        const ttsToggle = document.getElementById('tts-toggle');
+        let currentAudio = null;
+        let ttsQueue = [];
+        let isSpeaking = false;
+
+        ttsToggle.addEventListener('change', (e) => {
+            state.ttsEnabled = e.target.checked;
+            if (state.ttsEnabled) {
+                speakAlert("Voice alerts enabled.");
+            } else {
+                //Clear queue and stop current audio if disabled
+                ttsQueue = [];
+                if (currentAudio) {
+                    currentAudio.pause();
+                    currentAudio = null;
+                }
+                isSpeaking = false;
+            }
+        });
+
+        async function processTtsQueue() {
+            if (isSpeaking || ttsQueue.length === 0 || !state.ttsEnabled) return;
+            isSpeaking = true;
+
+            const item = ttsQueue.shift();
+            const text = typeof item === 'string' ? item : item.text;
+            try {
+                const resp = await fetch('/api/tts', {
+                    method: 'POST',
+                    headers: { 'Content-Type': 'application/json' },
+                    body: JSON.stringify({ text })
+                });
+
+                if (resp.ok) {
+                    const blob = await resp.blob();
+                    const url = URL.createObjectURL(blob);
+                    currentAudio = new Audio(url);
+
+                    //Wait for audio to finish playing before moving to the next item
+                    await new Promise(resolve => {
+                        currentAudio.addEventListener('ended', () => {
+                            URL.revokeObjectURL(url);
+                            resolve();
+                        });
+                        currentAudio.addEventListener('error', (err) => {
+                            console.error('Audio playback error:', err);
+                            resolve();
+                        });
+                        currentAudio.play().catch(err => {
+                            console.error('Audio play blocked:', err);
+                            resolve();
+                        });
+                    });
+                    currentAudio = null;
+                } else {
+                    console.error('TTS request failed:', resp.status);
+                }
+            } catch (err) {
+                console.error('TTS error:', err);
+            }
+
+            isSpeaking = false;
+            //Process next in queue
+            processTtsQueue();
+        }
+
+        function speakAlert(text, severity = 4) {
+            if (!state.ttsEnabled) return;
+            ttsQueue.push({text, severity});
+            ttsQueue.sort((a, b) => a.severity - b.severity);
+            processTtsQueue();
+        }
+
+        //Camera Feed UI
+        const cameraFeed = document.getElementById('camera-feed');
+        const feedTitle = document.getElementById('feed-title');
+        const feedImage = document.getElementById('feed-image');
+
+        document.getElementById('close-feed').addEventListener('click', () => {
+            cameraFeed.classList.add('hidden');
+        });
+
+        function showCameraFeed(alert) {
+            feedTitle.innerText = `Camera ${alert.camera_id} (${alert.status})`;
+            if (alert.image_b64) {
+                feedImage.src = `data:image/jpeg;base64,${alert.image_b64}`;
+            }
+            cameraFeed.classList.remove('hidden');
+        }
+
+        //UI Updates
+        const statusColors = {
+            "Normal Flow": "#2ecc71",     //Green
+            "Moderate Traffic": "#f1c40f",//Yellow
+            "Heavy Traffic": "#e67e22",   //Orange
+            "Severe Congestion": "#e74c3c"//Red
+        };
+
+        const statusIcons = {
+            "Normal Flow": "🟢",
+            "Moderate Traffic": "🟡",
+            "Heavy Traffic": "🟠",
+            "Severe Congestion": "🔴"
+        };
+
+        function updateStats() {
+            let vehicles = 0;
+            let incidents = 0;
+            const cameras = Object.keys(state.alerts).length;
+
+            Object.values(state.alerts).forEach(alert => {
+                vehicles += alert.vehicle_count;
+                if (alert.status === "Heavy Traffic" || alert.status === "Severe Congestion") {
+                    incidents++;
+                }
+            });
+
+            document.getElementById('stat-cameras').innerText = cameras;
+            document.getElementById('stat-vehicles').innerText = vehicles;
+            document.getElementById('stat-incidents').innerText = incidents;
+        }
+
+        function createAlertCard(alert) {
+            const card = document.createElement('div');
+            card.className = `alert-card ${alert.status.replace(/\s+/g, '-').toLowerCase()}`;
+            card.id = `alert-${alert.camera_id}`;
+
+            const color = statusColors[alert.status];
+            const icon = statusIcons[alert.status];
+
+            card.innerHTML = `
+                <div class="card-header">
+                    <span class="cam-id">Cam ${alert.camera_id}</span>
+                    <span class="time">${new Date(alert.timestamp).toLocaleTimeString()}</span>
+                </div>
+                <div class="card-body">
+                    <div class="status-tag" style="background-color: ${color}20; color: ${color}; border: 1px solid ${color}40;">
+                        ${icon} ${alert.status}
+                    </div>
+                    <div class="details">
+                        <div class="metric"><strong>${alert.vehicle_count}</strong> Vehicles</div>
+                        <div class="sub-metrics">
+                            <span>🚗 ${alert.car_count}</span>
+                            <span>🏍️ ${alert.motorcycle_count || 0}</span>
+                            <span>🚌 ${alert.bus_count}</span>
+                            <span>🚛 ${alert.truck_count}</span>
+                        </div>
+                    </div>
+                </div>
+            `;
+
+            //Show image on click
+            card.addEventListener('click', () => {
+                const marker = state.markers[alert.camera_id];
+                if (marker) {
+                    map.setView(marker.getLatLng(), 15, { animate: true });
+                    marker.openPopup();
+                }
+                showCameraFeed(alert);
+            });
+
+            return card;
+        }
+
+        function updateMapMarker(alert) {
+            if (!alert.location || !alert.location.latitude) return;
+
+            const lat = alert.location.latitude;
+            const lon = alert.location.longitude;
+            const color = statusColors[alert.status];
+
+            //Create a custom circle marker
+            if (state.markers[alert.camera_id]) {
+                //Update existing
+                const marker = state.markers[alert.camera_id];
+                marker.setLatLng([lat, lon]);
+                marker.setStyle({ color: color, fillColor: color });
+                marker.setPopupContent(`<b>Cam ${alert.camera_id}</b><br>${alert.status}<br>Vehicles: ${alert.vehicle_count}`);
+            } else {
+                //Create new
+                const marker = L.circleMarker([lat, lon], {
+                    radius: 8,
+                    fillColor: color,
+                    color: color,
+                    weight: 2,
+                    opacity: 1,
+                    fillOpacity: 0.6
+                }).addTo(map);
+
+                marker.bindPopup(`<b>Cam ${alert.camera_id}</b><br>${alert.status}<br>Vehicles: ${alert.vehicle_count}`);
+
+                //Show feed on marker click too
+                marker.on('click', () => showCameraFeed(state.alerts[alert.camera_id]));
+                state.markers[alert.camera_id] = marker;
+            }
+        }
+
+        function processAlert(alert) {
+            const prevAlert = state.alerts[alert.camera_id];
+
+            //If the status literally worsened OR if vehicles increased significantly (+5) while already heavy/severe
+            const severityOrder = { "Severe Congestion": 0, "Heavy Traffic": 1, "Moderate Traffic": 2, "Normal Flow": 3 };
+            const prevSev = prevAlert ? (severityOrder[prevAlert.status] ?? 4) : 4;
+            const newSev = severityOrder[alert.status] ?? 4;
+
+            const statusWorsened = prevAlert && (newSev < prevSev);
+            const countWorsened = prevAlert &&
+                (alert.vehicle_count >= prevAlert.vehicle_count + 5) &&
+                newSev <= 1; //Only care if it's already Heavy or Severe
+
+            const shouldAlert = statusWorsened || countWorsened || (!prevAlert && newSev <= 1);
+
+            //Store state
+            state.alerts[alert.camera_id] = alert;
+
+            //Update UI components
+            updateStats();
+            updateMapMarker(alert);
+
+            //Update feed
+            const feed = document.getElementById('alerts-list');
+            const existingCard = document.getElementById(`alert-${alert.camera_id}`);
+            const newCard = createAlertCard(alert);
+
+            if (existingCard) {
+                feed.replaceChild(newCard, existingCard);
+            } else {
+                feed.prepend(newCard); //Add to top
+            }
+
+            //Re-sort the entire sidebar by severity (worst first)
+            const cards = Array.from(feed.children);
+            cards.sort((a, b) => {
+                const aAlert = state.alerts[a.id.replace('alert-', '')];
+                const bAlert = state.alerts[b.id.replace('alert-', '')];
+                const aStatus = aAlert?.status || "Normal Flow";
+                const bStatus = bAlert?.status || "Normal Flow";
+                const sevDiff = (severityOrder[aStatus] ?? 4) - (severityOrder[bStatus] ?? 4);
+                if (sevDiff !== 0) return sevDiff;
+                //Within same severity, sort by vehicle count descending
+                return (bAlert?.vehicle_count || 0) - (aAlert?.vehicle_count || 0);
+            });
+            cards.forEach(card => feed.appendChild(card));
+
+            //Trigger TTS if we determined it should alert
+            if (shouldAlert) {
+                const message = `Alert on camera ${alert.camera_id}. ${alert.status} detected. ${alert.vehicle_count} vehicles.`;
+                speakAlert(message, newSev);
+
+                //Add flash animation to card
+                newCard.classList.add('flash');
+                setTimeout(() => newCard.classList.remove('flash'), 2000);
+            }
+
+            //If the feed overlay is currently open for this camera, update the image live
+            if (!cameraFeed.classList.contains('hidden') && feedTitle.innerText.includes(`Camera ${alert.camera_id}`)) {
+                showCameraFeed(alert);
+            }
+        }
+
+        //Socket.IO Connection
+        const socket = io();
+
+        socket.on('connect', () => {
+            console.log('Connected to WebSocket server');
+            document.querySelector('.pulse-dot').style.backgroundColor = '#2ecc71';
+        });
+
+        socket.on('disconnect', () => {
+            console.log('Disconnected from server');
+            document.querySelector('.pulse-dot').style.backgroundColor = '#e74c3c';
+        });
+
+        socket.on('new_alert', (alert) => {
+            console.log("New alert received:", alert);
+            processAlert(alert);
+        });
+
+        //Load initial data
+        Object.values(INITIAL_ALERTS).forEach(processAlert);
+
+    </script>
+</body>
+
+</html>

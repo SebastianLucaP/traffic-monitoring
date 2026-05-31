@@ -1,0 +1,28 @@
+# Python virtual environment
+smart_city_env/
+
+# Large files
+Archive.zip
+yolo26x.pt
+
+# Python cache
+__pycache__/
+*.pyc
+*.pyo
+*.egg-info/
+dist/
+build/
+
+# IDE
+.vscode/
+.idea/
+
+# OS
+.DS_Store
+Thumbs.db
+
+# Other project's PDF (not related to this project)
+Distributed Consensus Algorithms for Edge and Cloud Collaboration Phase 4.pdf
+pdf.txt
+presentation_slides.txt
+presentation_spoken_text_ro.txt
